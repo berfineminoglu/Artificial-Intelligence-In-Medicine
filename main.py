@@ -368,18 +368,27 @@ def construct_feature_vector(preprocessed, mask):
     13 boyutlu özellik vektörünü oluştur
 
     Her piksel için 13 özellik:
-    - 9 Gabor binary özellik
+    - 9 Gabor özellik (sürekli değerler - binary değil!)
     - 1 G kanalı (enhanced)
     - 1 Top Hat
     - 1 Shade Corrected
     - 1 Bit Plane Slicing
+
+    NOT: Makale binary Gabor kullanıyor ama daha iyi sonuç için
+    sürekli değerler kullanıyoruz.
     """
     G, Y, L = preprocessed["G"], preprocessed["Y"], preprocessed["L"]
-    G_original = preprocessed["G_original"]
 
     print("  Gabor özellikleri çıkarılıyor...")
     gabor_features = extract_gabor_features(G, Y, L)
-    binary_gabor = binarize_gabor_features(gabor_features)
+
+    # Gabor özelliklerini normalize et (0-255 arası)
+    gabor_normalized = []
+    for gf in gabor_features:
+        normalized = cv2.normalize(gf, None, 0, 255, cv2.NORM_MINMAX).astype(
+            np.uint8
+        )
+        gabor_normalized.append(normalized)
 
     print("  Top Hat özelliği çıkarılıyor...")
     tophat = extract_tophat_feature(G)
@@ -390,8 +399,8 @@ def construct_feature_vector(preprocessed, mask):
     print("  BPS özelliği çıkarılıyor...")
     bps = extract_bps_feature(G)
 
-    # Tüm özellikleri birleştir
-    all_features = binary_gabor + [G, tophat, sc, bps]
+    # Tüm özellikleri birleştir (hepsi sürekli değerler)
+    all_features = gabor_normalized + [G, tophat, sc, bps]
 
     # Sadece FOV içindeki pikselleri al
     h, w = mask.shape
@@ -401,7 +410,7 @@ def construct_feature_vector(preprocessed, mask):
     for y in range(h):
         for x in range(w):
             if mask[y, x] > 0:  # FOV içinde
-                fv = [f[y, x] for f in all_features]
+                fv = [float(f[y, x]) for f in all_features]
                 feature_vectors.append(fv)
                 pixel_coords.append((y, x))
 
@@ -504,9 +513,11 @@ def fcm_clustering(data, n_clusters=2, m=2, max_iter=2000, error=1e-6):
     return U, centers
 
 
-def apply_fcm(feature_vectors):
+def apply_fcm(feature_vectors, threshold=0.7):
     """
     FCM uygula ve damar/arka plan kümelerini belirle
+
+    threshold: Üyelik eşiği - sadece bu değerin üstündeki pikseller damar sayılır
     """
     print("  FCM kümeleme uygulanıyor...")
 
@@ -523,7 +534,11 @@ def apply_fcm(feature_vectors):
     # Damar olasılıkları
     vessel_probs = U[:, vessel_cluster]
 
-    return labels, vessel_probs, vessel_cluster
+    # Sadece yüksek olasılıklı pikselleri damar say (daha katı kriter)
+    # Bu false positive'leri azaltır
+    high_confidence_vessels = vessel_probs > threshold
+
+    return labels, vessel_probs, vessel_cluster, high_confidence_vessels
 
 
 # =============================================================================
@@ -542,9 +557,18 @@ Biz sklearn'ün DecisionTreeClassifier'ını kullanacağız.
 def train_decision_tree(X_train, y_train):
     """
     Karar ağacı eğit
+
+    class_weight='balanced': Dengesiz veri setleri için otomatik ağırlık
     """
+    if len(X_train) == 0:
+        return None
+
     clf = DecisionTreeClassifier(
-        random_state=42, max_depth=20, min_samples_split=10, min_samples_leaf=5
+        random_state=42,
+        max_depth=15,
+        min_samples_split=20,
+        min_samples_leaf=10,
+        class_weight="balanced",
     )
     clf.fit(X_train, y_train)
     return clf
@@ -556,7 +580,7 @@ def prepare_training_data(
     ground_truth,
     mask,
     fcm_vessel_mask,
-    n_samples=10000,
+    n_samples=20000,
 ):
     """
     Eğitim verisi hazırla
@@ -564,35 +588,53 @@ def prepare_training_data(
     Makale'ye göre:
     - DRIVE için her görüntüden 10,000 piksel
     - Sadece FCM'in arka plan olarak belirlediği piksellerden
+
+    Dengelenmiş eğitim seti oluştur (eşit sayıda damar ve arka plan)
     """
-    # FCM'in arka plan dediği pikselleri filtrele
-    non_vessel_indices = []
+    vessel_samples = []
+    non_vessel_samples = []
 
     for idx, (y, x) in enumerate(pixel_coords):
         if not fcm_vessel_mask[idx]:  # FCM'e göre arka plan
-            non_vessel_indices.append(idx)
+            is_vessel = ground_truth[y, x] > 0
+            if is_vessel:
+                vessel_samples.append(idx)
+            else:
+                non_vessel_samples.append(idx)
 
-    # Bu piksellerden eğitim verisi oluştur
-    X_train = []
-    y_train = []
+    # Dengelenmiş örnekleme
+    n_each = min(n_samples // 2, len(vessel_samples), len(non_vessel_samples))
 
-    for idx in non_vessel_indices:
-        y, x = pixel_coords[idx]
-        X_train.append(feature_vectors[idx])
-        # Ground truth'a göre etiketle
-        if ground_truth[y, x] > 0:
-            y_train.append(1)  # Damar
-        else:
-            y_train.append(0)  # Arka plan
+    if n_each == 0:
+        print("  UYARI: Yeterli eğitim verisi yok!")
+        return np.array([]), np.array([])
 
-    X_train = np.array(X_train)
-    y_train = np.array(y_train)
+    # Rastgele örnekle
+    np.random.seed(42)
+    vessel_indices = np.random.choice(vessel_samples, n_each, replace=False)
+    non_vessel_indices = np.random.choice(
+        non_vessel_samples, n_each, replace=False
+    )
 
-    # Örnekle (çok fazla veri varsa)
-    if len(X_train) > n_samples:
-        indices = np.random.choice(len(X_train), n_samples, replace=False)
-        X_train = X_train[indices]
-        y_train = y_train[indices]
+    # Birleştir
+    all_indices = np.concatenate([vessel_indices, non_vessel_indices])
+    np.random.shuffle(all_indices)
+
+    X_train = feature_vectors[all_indices]
+    y_train = np.array(
+        [
+            (
+                1
+                if ground_truth[pixel_coords[i][0], pixel_coords[i][1]] > 0
+                else 0
+            )
+            for i in all_indices
+        ]
+    )
+
+    print(
+        f"  Eğitim seti: {len(X_train)} örnek ({n_each} damar, {n_each} arka plan)"
+    )
 
     return X_train, y_train
 
@@ -607,7 +649,8 @@ def post_process(vessel_mask, mask, reduction=5):
     Son işleme
 
     Makale Section 3.4'te açıklanıyor:
-    FOV kenarındaki yanlış pozitif tespitleri kaldır
+    1. FOV kenarındaki yanlış pozitif tespitleri kaldır
+    2. Morfolojik temizleme (küçük gürültüleri kaldır)
     """
     # Maskeyi küçült
     kernel = np.ones((reduction * 2 + 1, reduction * 2 + 1), np.uint8)
@@ -616,7 +659,24 @@ def post_process(vessel_mask, mask, reduction=5):
     # Küçültülmüş maskeyi uygula
     result = vessel_mask & eroded_mask
 
-    return result
+    # Morfolojik açma (opening) - küçük gürültüleri kaldır
+    kernel_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    result = cv2.morphologyEx(result, cv2.MORPH_OPEN, kernel_open)
+
+    # Küçük bağlı bileşenleri kaldır (gürültü temizleme)
+    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
+        result, connectivity=8
+    )
+
+    # Minimum alan eşiği (çok küçük bölgeler gürültüdür)
+    min_area = 15
+
+    cleaned = np.zeros_like(result)
+    for i in range(1, num_labels):  # 0 arka plan
+        if stats[i, cv2.CC_STAT_AREA] >= min_area:
+            cleaned[labels == i] = 255
+
+    return cleaned
 
 
 # =============================================================================
@@ -709,11 +769,12 @@ def process_single_image(
 
     # 5. FCM Kümeleme
     print("  FCM kümeleme yapılıyor...")
-    fcm_labels, fcm_probs, vessel_cluster = apply_fcm(pca_features)
+    fcm_labels, fcm_probs, vessel_cluster, fcm_vessel_mask = apply_fcm(
+        pca_features, threshold=0.65
+    )
 
     # FCM sonucunu görüntüye dönüştür
     h, w = preprocessed["mask"].shape
-    fcm_vessel_mask = fcm_labels == vessel_cluster
     fcm_result = np.zeros((h, w), dtype=np.uint8)
     for idx, (y, x) in enumerate(pixel_coords):
         if fcm_vessel_mask[idx]:
@@ -729,27 +790,37 @@ def process_single_image(
             preprocessed["mask"],
             fcm_vessel_mask,
         )
-        classifier = train_decision_tree(X_train, y_train)
+        if len(X_train) > 0:
+            classifier = train_decision_tree(X_train, y_train)
+        else:
+            classifier = None
 
     print("  Karar ağacı sınıflandırması yapılıyor...")
     # Sadece FCM'in arka plan dediği pikselleri sınıflandır
     dt_result = np.zeros((h, w), dtype=np.uint8)
 
-    non_vessel_features = []
-    non_vessel_coords = []
+    if classifier is not None:
+        non_vessel_features = []
+        non_vessel_coords = []
 
-    for idx, (y, x) in enumerate(pixel_coords):
-        if not fcm_vessel_mask[idx]:
-            non_vessel_features.append(pca_features[idx])
-            non_vessel_coords.append((y, x))
+        for idx, (y, x) in enumerate(pixel_coords):
+            if not fcm_vessel_mask[idx]:
+                non_vessel_features.append(pca_features[idx])
+                non_vessel_coords.append((y, x))
 
-    if len(non_vessel_features) > 0:
-        non_vessel_features = np.array(non_vessel_features)
-        predictions = classifier.predict(non_vessel_features)
+        if len(non_vessel_features) > 0:
+            non_vessel_features = np.array(non_vessel_features)
 
-        for idx, (y, x) in enumerate(non_vessel_coords):
-            if predictions[idx] == 1:
-                dt_result[y, x] = 255
+            # Olasılık tahmini yap
+            predictions_proba = classifier.predict_proba(non_vessel_features)
+
+            # Threshold uygula (dengelenmiş değer)
+            threshold = 0.55
+            predictions = (predictions_proba[:, 1] > threshold).astype(int)
+
+            for idx, (y, x) in enumerate(non_vessel_coords):
+                if predictions[idx] == 1:
+                    dt_result[y, x] = 255
 
     # 7. FCM ve DT sonuçlarını birleştir
     combined_result = np.maximum(fcm_result, dt_result)
