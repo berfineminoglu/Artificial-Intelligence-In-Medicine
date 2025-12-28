@@ -158,7 +158,7 @@ def preprocess_image(image, mask):
 """
 
 
-def apply_gabor_filter(image, wavelength, orientation_count=12):
+def apply_gabor_filter(image, wavelength, orientation_count=24):
     """
     Gabor filtresi uygula
 
@@ -169,7 +169,9 @@ def apply_gabor_filter(image, wavelength, orientation_count=12):
     - wavelength: 9, 10, 11 (damar kalınlığına göre)
     - aspect ratio: 0.5
     - bandwidth: 1
-    - orientation: 0'dan başlayıp 15 derece aralıklarla (12 yön)
+    - orientation: 0'dan başlayıp 15 derece aralıklarla
+
+    24 yön kullanarak daha hassas damar tespiti yapıyoruz.
     """
     # Tüm yönlerdeki maksimum yanıtı al
     max_response = np.zeros_like(image, dtype=np.float64)
@@ -177,12 +179,15 @@ def apply_gabor_filter(image, wavelength, orientation_count=12):
     for i in range(orientation_count):
         theta = i * np.pi / orientation_count  # 0 ile π arasında yönler
 
-        # Gabor filtresi uygula
-        # sigma = wavelength * 0.5 / π ≈ wavelength * 0.16
-        sigma = wavelength * 0.56  # bandwidth=1 için yaklaşık değer
+        # Gabor kernel boyutu
+        kernel_size = int(wavelength * 4) | 1  # Tek sayı olmalı
+        if kernel_size < 5:
+            kernel_size = 5
+
+        # Sigma hesapla (bandwidth=1 için)
+        sigma = wavelength * 0.56
 
         # OpenCV Gabor kernel
-        kernel_size = int(wavelength * 3) | 1  # Tek sayı olmalı
         kernel = cv2.getGaborKernel(
             (kernel_size, kernel_size),
             sigma=sigma,
@@ -192,11 +197,14 @@ def apply_gabor_filter(image, wavelength, orientation_count=12):
             psi=0,
         )
 
+        # Normalize et
+        kernel = kernel / kernel.sum()
+
         # Filtrele
         filtered = cv2.filter2D(image, cv2.CV_64F, kernel)
 
         # Maksimum yanıtı güncelle
-        max_response = np.maximum(max_response, filtered)
+        max_response = np.maximum(max_response, np.abs(filtered))
 
     return max_response
 
@@ -289,22 +297,35 @@ def extract_tophat_feature(G_channel):
     # G kanalını ters çevir (damarlar koyu, ters çevirince parlak olur)
     inverted = 255 - G_channel
 
-    # 9 farklı yönde Top Hat uygula ve maksimumu al
+    # 12 farklı yönde Top Hat uygula ve maksimumu al
     max_tophat = np.zeros_like(inverted, dtype=np.float64)
 
-    for i in range(9):
-        angle = i * 22.5  # 0, 22.5, 45, 67.5, 90, 112.5, 135, 157.5, 180
+    length = 21
+    for i in range(12):
+        angle = i * 15  # 0, 15, 30, ..., 165 derece
 
         # Çizgisel yapısal eleman oluştur
-        length = 21
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (length, 1))
+        # Döndürülmüş çizgi için koordinatları hesapla
+        rad = np.deg2rad(angle)
+        dx = int(np.cos(rad) * length / 2)
+        dy = int(np.sin(rad) * length / 2)
 
-        # Döndür
-        M = cv2.getRotationMatrix2D((length // 2, 0), angle, 1)
-        kernel_rotated = cv2.warpAffine(kernel, M, (length, length))
+        # Kernel boyutu
+        ksize = max(abs(dx), abs(dy)) * 2 + 3
+        kernel = np.zeros((ksize, ksize), dtype=np.uint8)
 
-        # Top Hat uygula (opening sonrası çıkarma)
-        opened = cv2.morphologyEx(inverted, cv2.MORPH_OPEN, kernel_rotated)
+        # Çizgiyi çiz
+        center = ksize // 2
+        cv2.line(
+            kernel,
+            (center - dx, center - dy),
+            (center + dx, center + dy),
+            1,
+            1,
+        )
+
+        # Top Hat uygula
+        opened = cv2.morphologyEx(inverted, cv2.MORPH_OPEN, kernel)
         tophat = inverted.astype(np.float64) - opened.astype(np.float64)
 
         # Maksimumu güncelle
@@ -668,8 +689,8 @@ def post_process(vessel_mask, mask, reduction=5):
         result, connectivity=8
     )
 
-    # Minimum alan eşiği (çok küçük bölgeler gürültüdür)
-    min_area = 15
+    # Minimum alan eşiği (gürültü vs ince damar dengesi)
+    min_area = 12
 
     cleaned = np.zeros_like(result)
     for i in range(1, num_labels):  # 0 arka plan
@@ -770,7 +791,7 @@ def process_single_image(
     # 5. FCM Kümeleme
     print("  FCM kümeleme yapılıyor...")
     fcm_labels, fcm_probs, vessel_cluster, fcm_vessel_mask = apply_fcm(
-        pca_features, threshold=0.65
+        pca_features, threshold=0.60
     )
 
     # FCM sonucunu görüntüye dönüştür
@@ -815,7 +836,7 @@ def process_single_image(
             predictions_proba = classifier.predict_proba(non_vessel_features)
 
             # Threshold uygula (dengelenmiş değer)
-            threshold = 0.55
+            threshold = 0.58
             predictions = (predictions_proba[:, 1] > threshold).astype(int)
 
             for idx, (y, x) in enumerate(non_vessel_coords):
