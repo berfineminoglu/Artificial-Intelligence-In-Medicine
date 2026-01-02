@@ -148,10 +148,8 @@ def kmeans_segment(features, threshold=0.5):
     labels = kmeans.fit_predict(feat_norm)
 
     # Vessel cluster has fewer pixels
-    if np.sum(labels == 0) < np.sum(labels == 1):
-        vessel_label = 0
-    else:
-        vessel_label = 1
+    counts = [np.sum(labels == 0), np.sum(labels == 1)]
+    vessel_label = 0 if counts[0] < counts[1] else 1
 
     # Calculate distances to cluster centers for confidence
     distances = kmeans.transform(feat_norm)
@@ -171,6 +169,7 @@ def train_classifier(X, y):
         n_estimators=100,
         max_depth=15,
         min_samples_split=10,
+        min_samples_leaf=5,
         class_weight="balanced",
         random_state=42,
         n_jobs=-1,
@@ -218,15 +217,16 @@ def post_process(vessel_img, mask):
     mask_eroded = cv2.erode(mask, kernel)
     result = vessel_img & mask_eroded
 
-    # Morphological opening
+    # Morphological opening - remove small noise
     kernel_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2, 2))
     result = cv2.morphologyEx(result, cv2.MORPH_OPEN, kernel_open)
 
-    # Remove small components
+    # Remove small components (noise)
     n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(result, 8)
     result_clean = np.zeros_like(result)
+
     for i in range(1, n_labels):
-        if stats[i, cv2.CC_STAT_AREA] >= 8:
+        if stats[i, cv2.CC_STAT_AREA] >= 15:
             result_clean[labels == i] = 255
 
     return result_clean
@@ -278,7 +278,7 @@ def process_image(
     features_pca = pca.fit_transform(features)
 
     # K-Means clustering (unsupervised - thick vessels)
-    kmeans_mask, confidence = kmeans_segment(features_pca, threshold=0.45)
+    kmeans_mask, confidence = kmeans_segment(features_pca, threshold=0.48)
 
     h, w = prep["mask"].shape
     kmeans_result = np.zeros((h, w), dtype=np.uint8)
@@ -304,8 +304,8 @@ def process_image(
                 non_vessel_coords.append((y, x))
 
         if len(non_vessel_feat) > 0:
-            proba = classifier.predict_proba(np.array(non_vessel_feat))
-            preds = (proba[:, 1] > 0.6).astype(int)  # Daha katı threshold
+            proba = classifier.predict_proba(np.array(non_vessel_feat))[:, 1]
+            preds = (proba > 0.58).astype(int)
             for i, (y, x) in enumerate(non_vessel_coords):
                 if preds[i] == 1:
                     clf_result[y, x] = 255
