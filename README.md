@@ -1,22 +1,20 @@
 
-Retinal Blood Vessel Segmentation
-Reproduction of the paper "Retinal blood vessel extraction employing effective image features and combination of supervised and unsupervised machine learning methods" on the DRIVE retinal image dataset.
+Automated People Counting
+Estimates the number of people in video frames from pixel-based image features and a neural network regressor. The project reproduces the feature extraction methods and result tables of a research paper on crowd counting.
 
-The pipeline combines a supervised classifier (Decision Tree) with unsupervised clustering (Fuzzy C-Means) to separate blood vessels from the background in fundus images.
-
-Pipeline
-Pre-processing: The field of view is masked, and the green, Y (luma) and Lab L channels are extracted. Local contrast is enhanced with CLAHE.
-Feature extraction (13 features per pixel): Gabor filter responses at multiple wavelengths and angles, automatic thresholding, top-hat transform, shade correction and other vessel-sensitive features.
-Classification: Features are reduced with PCA and classified with a Decision Tree. Fuzzy C-Means clustering produces an unsupervised map, and the two are combined into a hybrid result.
-Post-processing: Small noisy regions are removed from the binary vessel map.
-Evaluation: Confusion matrix metrics and ROC AUC are computed and reported as tables.
-Intermediate results of each stage are saved as figures (Fig3 to Fig12), following the figures of the original paper.
-
+Method
+Pre-processing: Each frame is converted to grayscale and thresholded.
+Feature extraction: Three methods are compared:
+Method 1: Number of foreground pixels
+Method 2: Pixel count after morphological closing with disc-shaped structuring elements
+Method 3: Closed pixel count combined with an erosion ratio
+Regression: A multilayer perceptron (MLPRegressor) learns the mapping from features to people count. 153 frames are split into 102 for training and 51 for testing.
+Evaluation: Each method is run 10 times and the average percentage error is reported. Training and test results are plotted against the ground truth.
 Tech stack
-Python, OpenCV, NumPy, scikit-learn (PCA, Decision Tree, ROC AUC), scikit-fuzzy, Pillow
+Python, OpenCV, NumPy, scikit-learn, Matplotlib
 
 How to run
-pip install opencv-python numpy scikit-learn scikit-fuzzy pillow tabulate
-python main.py
-The script expects the DRIVE dataset in a folder named DRIVE next to main.py.
+pip install opencv-python numpy scikit-learn matplotlib
+python people_count.py
+The dataset is in VideoDataset/. Result figures are saved to Final_Output/.
 
